@@ -510,7 +510,7 @@ public class DescriptorGeneratorMojo extends AbstractGeneratorMojo {
         }
     }
 
-    private void generateFactory(MojoDescriptor md) throws IOException {
+    private void generateFactory(MojoDescriptor md) throws IOException, GeneratorException {
         String mojoClassName = md.getImplementation();
         String packageName = mojoClassName.substring(0, mojoClassName.lastIndexOf('.'));
         String generatorClassName = mojoClassName.substring(mojoClassName.lastIndexOf('.') + 1) + "Factory";
@@ -518,7 +518,12 @@ public class DescriptorGeneratorMojo extends AbstractGeneratorMojo {
 
         getLog().debug("Generating v4 factory for " + mojoClassName);
 
-        byte[] bin = computeGeneratorClassBytes(packageName, generatorClassName, mojoName, mojoClassName);
+        ClassReader mojoClass;
+        try (InputStream is = Files.newInputStream(
+                classesOutputDirectory.toPath().resolve(mojoClassName.replace('.', '/') + ".class"))) {
+            mojoClass = new ClassReader(is);
+        }
+        byte[] bin = computeGeneratorClassBytes(packageName, generatorClassName, mojoName, mojoClassName, mojoClass);
 
         try (OutputStream os = new CachingOutputStream(classesOutputDirectory
                 .toPath()
@@ -529,6 +534,24 @@ public class DescriptorGeneratorMojo extends AbstractGeneratorMojo {
 
     static byte[] computeGeneratorClassBytes(
             String packageName, String generatorClassName, String mojoName, String mojoClassName) {
+        return computeGeneratorClassBytes(packageName, generatorClassName, mojoName, mojoClassName, null, null);
+    }
+
+    private static byte[] computeGeneratorClassBytes(
+            String packageName, String generatorClassName, String mojoName, String mojoClassName, ClassReader mojoClass)
+            throws GeneratorException {
+        ConstructorInfo constructor = findConstructor(mojoClass, mojoClassName);
+        return computeGeneratorClassBytes(
+                packageName, generatorClassName, mojoName, mojoClassName, mojoClass, constructor);
+    }
+
+    private static byte[] computeGeneratorClassBytes(
+            String packageName,
+            String generatorClassName,
+            String mojoName,
+            String mojoClassName,
+            ClassReader mojoClass,
+            ConstructorInfo constructor) {
         String mojo = mojoClassName.replace('.', '/');
         ClassWriter cw = new ClassWriter(ClassWriter.COMPUTE_FRAMES | ClassWriter.COMPUTE_MAXS);
         cw.visitSource(generatorClassName + ".java", null);
@@ -543,15 +566,134 @@ public class DescriptorGeneratorMojo extends AbstractGeneratorMojo {
                 null,
                 mojo,
                 null);
-        MethodVisitor mv = cw.visitMethod(ACC_PUBLIC + ACC_SYNTHETIC, "<init>", "()V", null, null);
+        String descriptor = constructor == null ? "()V" : constructor.descriptor;
+        MethodVisitor mv = cw.visitMethod(
+                ACC_PUBLIC + ACC_SYNTHETIC,
+                "<init>",
+                descriptor,
+                constructor == null ? null : constructor.signature,
+                constructor == null ? null : constructor.exceptions);
+        if (constructor != null) {
+            if (constructor.injected) {
+                mv.visitAnnotation("Lorg/apache/maven/api/di/Inject;", true).visitEnd();
+            }
+            copyParameterAnnotations(mojoClass, descriptor, mv);
+        }
         mv.visitCode();
         mv.visitVarInsn(Opcodes.ALOAD, 0);
-        mv.visitMethodInsn(Opcodes.INVOKESPECIAL, mojo, "<init>", "()V", false);
+        int slot = 1;
+        for (Type type : Type.getArgumentTypes(descriptor)) {
+            mv.visitVarInsn(type.getOpcode(Opcodes.ILOAD), slot);
+            slot += type.getSize();
+        }
+        mv.visitMethodInsn(Opcodes.INVOKESPECIAL, mojo, "<init>", descriptor, false);
         mv.visitInsn(Opcodes.RETURN);
         mv.visitMaxs(-1, -1);
         mv.visitEnd();
         cw.visitEnd();
         return cw.toByteArray();
+    }
+
+    private static ConstructorInfo findConstructor(ClassReader mojoClass, String mojoClassName)
+            throws GeneratorException {
+        List<ConstructorInfo> constructors = new ArrayList<>();
+        mojoClass.accept(
+                new ClassVisitor(Opcodes.ASM9) {
+                    @Override
+                    public MethodVisitor visitMethod(
+                            int access, String name, String descriptor, String signature, String[] exceptions) {
+                        if (!"<init>".equals(name)) {
+                            return null;
+                        }
+                        ConstructorInfo constructor = new ConstructorInfo(access, descriptor, signature, exceptions);
+                        constructors.add(constructor);
+                        return new MethodVisitor(Opcodes.ASM9) {
+                            @Override
+                            public AnnotationVisitor visitAnnotation(String annotation, boolean visible) {
+                                if ("Lorg/apache/maven/api/di/Inject;".equals(annotation)) {
+                                    constructor.injected = true;
+                                }
+                                return null;
+                            }
+                        };
+                    }
+                },
+                ClassReader.SKIP_CODE | ClassReader.SKIP_DEBUG | ClassReader.SKIP_FRAMES);
+
+        ConstructorInfo selected = null;
+        for (ConstructorInfo constructor : constructors) {
+            if (constructor.injected) {
+                if (selected != null) {
+                    throw new GeneratorException(
+                            "Maven 4 mojo " + mojoClassName + " has multiple @Inject constructors", null);
+                }
+                selected = constructor;
+            }
+        }
+        if (selected == null) {
+            if (constructors.size() == 1) {
+                selected = constructors.get(0);
+            } else {
+                for (ConstructorInfo constructor : constructors) {
+                    if ("()V".equals(constructor.descriptor)) {
+                        selected = constructor;
+                        break;
+                    }
+                }
+            }
+        }
+        if (selected == null || (selected.access & ACC_PRIVATE) != 0) {
+            throw new GeneratorException(
+                    "Maven 4 mojo " + mojoClassName + " needs an accessible no-arg or @Inject constructor", null);
+        }
+        return selected;
+    }
+
+    private static void copyParameterAnnotations(ClassReader mojoClass, String descriptor, MethodVisitor target) {
+        mojoClass.accept(
+                new ClassVisitor(Opcodes.ASM9) {
+                    @Override
+                    public MethodVisitor visitMethod(
+                            int access, String name, String methodDescriptor, String signature, String[] exceptions) {
+                        if (!"<init>".equals(name) || !descriptor.equals(methodDescriptor)) {
+                            return null;
+                        }
+                        return new MethodVisitor(Opcodes.ASM9) {
+                            @Override
+                            public void visitAnnotableParameterCount(int parameterCount, boolean visible) {
+                                target.visitAnnotableParameterCount(parameterCount, visible);
+                            }
+
+                            @Override
+                            public AnnotationVisitor visitParameterAnnotation(
+                                    int parameter, String annotation, boolean visible) {
+                                return target.visitParameterAnnotation(parameter, annotation, visible);
+                            }
+
+                            @Override
+                            public AnnotationVisitor visitTypeAnnotation(
+                                    int typeRef, TypePath typePath, String annotation, boolean visible) {
+                                return target.visitTypeAnnotation(typeRef, typePath, annotation, visible);
+                            }
+                        };
+                    }
+                },
+                ClassReader.SKIP_CODE | ClassReader.SKIP_DEBUG | ClassReader.SKIP_FRAMES);
+    }
+
+    private static final class ConstructorInfo {
+        private final int access;
+        private final String descriptor;
+        private final String signature;
+        private final String[] exceptions;
+        private boolean injected;
+
+        private ConstructorInfo(int access, String descriptor, String signature, String[] exceptions) {
+            this.access = access;
+            this.descriptor = descriptor;
+            this.signature = signature;
+            this.exceptions = exceptions;
+        }
     }
 
     private PluginDescriptor extendPluginDescriptor(PluginToolsRequest request) {
